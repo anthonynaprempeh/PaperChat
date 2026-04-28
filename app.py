@@ -1,13 +1,9 @@
 """
 app.py — PaperChat: General AI Research Paper Chatbot
-- Upload PDFs directly
-- Paste arXiv/PubMed/direct PDF URLs
-- Persistent index across sessions
-- Multi-paper chat with citations
+Uses BM25 keyword search (no heavy ML models) — fits in 512MB RAM
 """
 
 import os
-import io
 import json
 import base64
 import hashlib
@@ -15,43 +11,37 @@ import shutil
 import subprocess
 import tempfile
 import urllib.request
-import urllib.parse
 from pathlib import Path
 
 import anthropic
 import pdfplumber
-from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from llama_index.core import VectorStoreIndex, StorageContext, load_index_from_storage
-from llama_index.core.schema import TextNode
-from llama_index.core.settings import Settings
-from llama_index.core.node_parser import SentenceSplitter
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-
 # ── Config ────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-INDEX_DIR         = "./storage"
 IMAGES_DIR        = "./page_images"
 PAPERS_META_FILE  = "./papers_meta.json"
+PAPERS_TEXT_FILE  = "./papers_text.json"
 UI_FILE           = "./paperchat_ui.html"
-TOP_K             = 5
+TOP_K             = 6
 MAX_IMAGE_PAGES   = 2
 COST_PER_QUERY    = 0.008
 TOTAL_BUDGET      = 10.00
 COUNTER_FILE      = "./query_counter.json"
 MODEL             = "claude-haiku-4-5-20251001"
-CHUNK_SIZE        = 512
-CHUNK_OVERLAP     = 64
-IMAGE_DPI         = 150
+CHUNK_SIZE        = 600
+CHUNK_OVERLAP     = 80
+IMAGE_DPI         = 120
+PORT              = int(os.environ.get("PORT", 8000))
 
 SYSTEM_PROMPT = """You are PaperChat, an AI research assistant that answers questions based exclusively on uploaded research papers.
 
-You have access to text and visual content from the indexed papers. Always:
+Always:
 - Answer using only information from the provided context
-- Cite the source paper and page number for every claim
+- Cite the source paper and page number for every claim like: *(Smith et al., p.4)*
 - Be precise and academically rigorous
 - If the answer is not in the papers, say so clearly — never fabricate
 
@@ -59,21 +49,33 @@ You have access to text and visual content from the indexed papers. Always:
 - Use LaTeX for equations: inline $eq$ or display $$eq$$
 - Use **bold** for key terms
 - Use markdown tables for comparisons
-- Use headings for structured answers
-- Always include page and paper citations like: *(Smith et al., 2023, p.4)*
+- Always include paper and page citations
 
 If the question cannot be answered from the papers, respond:
-"I couldn't find information about that in the uploaded papers. Please check the papers directly or try rephrasing."
+"I couldn't find information about that in the uploaded papers. Please try rephrasing or upload a relevant paper."
 """
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
+# ── Anthropic client ──────────────────────────────────────────────────────────
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-def setup_embed():
-    Settings.llm = None
-    Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+# ── In-memory paper store (BM25-style keyword search) ─────────────────────────
+# Format: { pdf_hash: { "name": str, "pages": [ {"page": int, "text": str, "img": str} ] } }
+_paper_store = {}
 
-setup_embed()
+def load_paper_store():
+    global _paper_store
+    if Path(PAPERS_TEXT_FILE).exists():
+        try:
+            with open(PAPERS_TEXT_FILE) as f:
+                _paper_store = json.load(f)
+        except Exception:
+            _paper_store = {}
+
+def save_paper_store():
+    with open(PAPERS_TEXT_FILE, "w") as f:
+        json.dump(_paper_store, f)
+
+load_paper_store()
 
 # ── Papers metadata ───────────────────────────────────────────────────────────
 def load_papers_meta():
@@ -89,55 +91,92 @@ def save_papers_meta(meta):
     with open(PAPERS_META_FILE, "w") as f:
         json.dump(meta, f, indent=2)
 
-# ── Index management ──────────────────────────────────────────────────────────
-_index = None
+# ── BM25-style keyword search ─────────────────────────────────────────────────
+import math
+import re
+from collections import Counter
 
-def get_index():
-    global _index
-    if _index is not None:
-        return _index
-    if Path(INDEX_DIR).exists() and any(Path(INDEX_DIR).iterdir()):
-        try:
-            storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
-            _index = load_index_from_storage(storage_context)
-            return _index
-        except Exception:
-            pass
-    return None
+def tokenize(text):
+    return re.findall(r'\b[a-zA-Z]{2,}\b', text.lower())
 
-def rebuild_index(all_nodes):
-    global _index
-    Path(INDEX_DIR).mkdir(exist_ok=True)
-    _index = VectorStoreIndex(all_nodes, show_progress=False)
-    _index.storage_context.persist(persist_dir=INDEX_DIR)
-    return _index
+def bm25_score(query_tokens, doc_tokens, avg_dl, k1=1.5, b=0.75):
+    doc_len  = len(doc_tokens)
+    freq     = Counter(doc_tokens)
+    score    = 0.0
+    for term in set(query_tokens):
+        tf = freq.get(term, 0)
+        if tf == 0:
+            continue
+        idf = math.log(1 + 1)  # simplified IDF
+        tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / max(avg_dl, 1)))
+        score += idf * tf_norm
+    return score
+
+def search_papers(question, top_k=TOP_K):
+    """Search all indexed pages using BM25 keyword matching."""
+    if not _paper_store:
+        return []
+
+    query_tokens = tokenize(question)
+    if not query_tokens:
+        return []
+
+    # Compute average doc length
+    all_pages = []
+    for pdf_hash, paper in _paper_store.items():
+        for page in paper.get("pages", []):
+            tokens = tokenize(page.get("text", ""))
+            all_pages.append({
+                "hash":     pdf_hash,
+                "name":     paper["name"],
+                "page":     page["page"],
+                "text":     page["text"],
+                "img":      page.get("img", ""),
+                "tokens":   tokens,
+            })
+
+    if not all_pages:
+        return []
+
+    avg_dl = sum(len(p["tokens"]) for p in all_pages) / len(all_pages)
+
+    # Score all pages
+    scored = []
+    for p in all_pages:
+        score = bm25_score(query_tokens, p["tokens"], avg_dl)
+        if score > 0:
+            scored.append((score, p))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored[:top_k]]
 
 # ── PDF ingestion ─────────────────────────────────────────────────────────────
-def ingest_pdf_bytes(pdf_bytes: bytes, pdf_name: str) -> list:
-    """Ingest a PDF from bytes, return list of TextNodes."""
+def ingest_pdf_bytes(pdf_bytes: bytes, pdf_name: str) -> tuple:
+    """Ingest PDF bytes. Returns (pdf_hash, page_count)."""
+    pdf_hash = hashlib.md5(pdf_bytes).hexdigest()[:10]
+
+    if pdf_hash in _paper_store:
+        return pdf_hash, len(_paper_store[pdf_hash].get("pages", []))
+
     Path(IMAGES_DIR).mkdir(exist_ok=True)
-    pdf_hash = hashlib.md5(pdf_bytes).hexdigest()[:8]
-    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in pdf_name)
+    safe_name   = "".join(c if c.isalnum() or c in "._-" else "_" for c in pdf_name)
     images_subdir = Path(IMAGES_DIR) / f"{pdf_hash}_{safe_name}"
     images_subdir.mkdir(exist_ok=True)
 
-    nodes = []
-    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    pages = []
 
-    # Write to temp file for pdftoppm
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
 
     try:
-        # Rasterize pages
-        has_poppler = shutil.which("pdftoppm") is not None
+        # Rasterize pages (optional — skip if poppler not available)
         image_files = []
-        if has_poppler:
+        if shutil.which("pdftoppm"):
             prefix = str(images_subdir / "page")
             result = subprocess.run(
                 ["pdftoppm", "-jpeg", "-r", str(IMAGE_DPI), tmp_path, prefix],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=120
             )
             if result.returncode == 0:
                 image_files = sorted(images_subdir.glob("page*.jpg"))
@@ -148,139 +187,66 @@ def ingest_pdf_bytes(pdf_bytes: bytes, pdf_name: str) -> list:
             with pdfplumber.open(tmp_path) as pdf:
                 for page in pdf.pages:
                     pages_text.append((page.extract_text() or "").strip())
-        except Exception as e:
+        except Exception:
             pages_text = [""] * max(len(image_files), 1)
 
-        # Build nodes
+        n_pages = len(pages_text)
         for page_idx, page_text in enumerate(pages_text):
             page_num = page_idx + 1
             img_path = ""
             if image_files:
-                pad = len(str(len(pages_text)))
+                pad = len(str(n_pages))
                 matches = [f for f in image_files
                            if f.stem.endswith(str(page_num).zfill(pad))]
                 if matches:
                     img_path = str(matches[0])
 
-            is_abstract = (page_num <= 3 and page_text and
-                           "abstract" in page_text.lower())
-            if is_abstract:
-                retrieval_text = f"[ABSTRACT — {pdf_name}, page {page_num}]\n{page_text}"
-            else:
-                retrieval_text = page_text or f"[Page {page_num} of {pdf_name} — visual only]"
-
-            node = TextNode(
-                text=retrieval_text,
-                metadata={
-                    "file_name":   pdf_name,
-                    "page":        page_num,
-                    "page_label":  str(page_num),
-                    "image_path":  img_path,
-                    "is_abstract": is_abstract,
-                    "pdf_hash":    pdf_hash,
-                },
-                excluded_embed_metadata_keys=["image_path", "is_abstract", "pdf_hash"],
-                excluded_llm_metadata_keys=["image_path", "is_abstract", "pdf_hash"],
-            )
-            nodes.append(node)
+            pages.append({
+                "page": page_num,
+                "text": page_text,
+                "img":  img_path,
+            })
 
     finally:
         os.unlink(tmp_path)
 
-    return nodes
+    _paper_store[pdf_hash] = {"name": pdf_name, "pages": pages}
+    save_paper_store()
+    return pdf_hash, len(pages)
 
-
-def add_paper_to_index(nodes: list, pdf_name: str, pdf_hash: str,
-                       source_url: str = ""):
-    """Add new nodes to the existing index or create a new one."""
-    global _index
-    meta = load_papers_meta()
-
-    if pdf_hash in meta:
-        return False, "already_indexed"
-
-    existing_nodes = []
-    idx = get_index()
-    if idx is not None:
-        # Collect existing nodes from storage
-        try:
-            from llama_index.core import SimpleDirectoryReader
-            storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
-            existing_nodes = list(storage_context.docstore.docs.values())
-        except Exception:
-            existing_nodes = []
-
-    all_nodes = existing_nodes + nodes
-    rebuild_index(all_nodes)
-
-    meta[pdf_hash] = {
-        "name":       pdf_name,
-        "pages":      len(nodes),
-        "source_url": source_url,
-        "hash":       pdf_hash,
-    }
-    save_papers_meta(meta)
-    return True, "indexed"
-
-
-# ── URL fetching ──────────────────────────────────────────────────────────────
+# ── URL resolver ──────────────────────────────────────────────────────────────
 def resolve_paper_url(url: str):
-    """Try to resolve a URL to a direct PDF download."""
     url = url.strip()
-
-    # arXiv
     if "arxiv.org" in url:
-        # Convert abs to pdf
         url = url.replace("/abs/", "/pdf/")
         if not url.endswith(".pdf"):
-            url = url + ".pdf"
+            url += ".pdf"
         return url, None
-
-    # PubMed Central - try to get PDF link
-    if "ncbi.nlm.nih.gov/pmc" in url or "pubmedcentral" in url:
-        return None, "PubMed Central articles require manual PDF download. Please download the PDF and upload it directly."
-
-    # bioRxiv / medRxiv
     if "biorxiv.org" in url or "medrxiv.org" in url:
         if "/content/" in url and not url.endswith(".pdf"):
-            url = url + ".full.pdf"
+            url += ".full.pdf"
         return url, None
-
-    # Direct PDF link
-    if url.endswith(".pdf") or "pdf" in url.lower():
-        return url, None
-
-    # DOI
+    if "ncbi.nlm.nih.gov/pmc" in url:
+        return None, "PubMed Central requires manual PDF download. Please upload the PDF directly."
     if url.startswith("10.") or "doi.org" in url:
-        return None, "DOI links often point to paywalled journals. Please download the PDF and upload it directly, or use an open-access version (e.g. from arXiv)."
-
-    # Generic URL — try as-is
+        return None, "DOI links often point to paywalled journals. Please upload the PDF directly or use an arXiv link."
     return url, None
 
-
 def fetch_pdf_from_url(url: str):
-    """Fetch PDF bytes from a URL. Returns (bytes, filename, error)."""
     try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (research chatbot)"
-        })
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            if "pdf" not in content_type.lower() and not url.endswith(".pdf"):
-                return None, None, "URL does not appear to be a PDF. Try a direct PDF link."
-            data = resp.read()
-            # Guess filename from URL
+            data     = resp.read()
             filename = url.split("/")[-1].split("?")[0]
             if not filename.endswith(".pdf"):
-                filename = filename + ".pdf"
-            if not filename or filename == ".pdf":
+                filename += ".pdf"
+            if filename == ".pdf":
                 filename = "paper.pdf"
             return data, filename, None
     except Exception as e:
         return None, None, f"Could not fetch URL: {str(e)}"
 
-
-# ── Counter helpers ───────────────────────────────────────────────────────────
+# ── Counter ───────────────────────────────────────────────────────────────────
 def load_counter():
     if Path(COUNTER_FILE).exists():
         try:
@@ -293,29 +259,25 @@ def load_counter():
 def increment_counter():
     data = load_counter()
     data["queries"] += 1
-    data["spent"] = round(data["queries"] * COST_PER_QUERY, 4)
+    data["spent"]    = round(data["queries"] * COST_PER_QUERY, 4)
     with open(COUNTER_FILE, "w") as f:
         json.dump(data, f)
     return data
 
-# ── Vision message builder ────────────────────────────────────────────────────
-def build_messages(question, nodes):
+# ── Message builder ───────────────────────────────────────────────────────────
+def build_messages(question, results):
     content = [{"type": "text",
                 "text": f"Question: {question}\n\nContext from research papers:\n"}]
     images_added = 0
-    for node in nodes:
-        meta     = node.metadata or {}
-        filename = meta.get("file_name", "Unknown")
-        page     = meta.get("page_label", meta.get("page", "?"))
-        img_path = meta.get("image_path", "")
+    for r in results:
         content.append({"type": "text",
-                         "text": f"\n--- {filename}, page {page} ---\n{node.text}\n"})
-        if img_path and images_added < MAX_IMAGE_PAGES and Path(img_path).exists():
+                         "text": f"\n--- {r['name']}, page {r['page']} ---\n{r['text']}\n"})
+        if r.get("img") and images_added < MAX_IMAGE_PAGES and Path(r["img"]).exists():
             try:
-                with open(img_path, "rb") as f:
+                with open(r["img"], "rb") as f:
                     img_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
                 content.append({"type": "text",
-                                 "text": f"[Page image: {filename}, p.{page}]"})
+                                 "text": f"[Page image: {r['name']}, p.{r['page']}]"})
                 content.append({"type": "image",
                                  "source": {"type": "base64",
                                             "media_type": "image/jpeg",
@@ -330,9 +292,7 @@ def build_messages(question, nodes):
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(CORSMiddleware,
-                   allow_origins=["*"],
-                   allow_methods=["*"],
-                   allow_headers=["*"])
+                   allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_ui():
@@ -343,10 +303,9 @@ async def serve_ui():
 
 @app.get("/api/papers")
 async def get_papers():
-    meta = load_papers_meta()
+    meta   = load_papers_meta()
     papers = [{"name": v["name"], "pages": v["pages"],
-                "source_url": v.get("source_url", ""),
-                "hash": k}
+                "source_url": v.get("source_url", ""), "hash": k}
                for k, v in meta.items()]
     return JSONResponse({"papers": papers})
 
@@ -354,103 +313,71 @@ async def get_papers():
 async def status():
     counter = load_counter()
     meta    = load_papers_meta()
-    return {
-        "queries":       counter["queries"],
-        "spent":         counter["spent"],
-        "remaining":     round(TOTAL_BUDGET - counter["spent"], 4),
-        "budget":        TOTAL_BUDGET,
-        "papers_count":  len(meta),
-    }
+    return {"queries": counter["queries"], "spent": counter["spent"],
+            "remaining": round(TOTAL_BUDGET - counter["spent"], 4),
+            "budget": TOTAL_BUDGET, "papers_count": len(meta)}
 
 @app.post("/api/upload")
 async def upload_paper(file: UploadFile = File(...)):
-    """Upload a PDF file and add it to the index."""
-    if not file.filename.endswith(".pdf"):
+    if not file.filename.lower().endswith(".pdf"):
         return JSONResponse({"error": "Only PDF files are supported."}, status_code=400)
     try:
         pdf_bytes = await file.read()
-        pdf_hash  = hashlib.md5(pdf_bytes).hexdigest()[:8]
+        pdf_hash  = hashlib.md5(pdf_bytes).hexdigest()[:10]
         meta      = load_papers_meta()
         if pdf_hash in meta:
             return JSONResponse({"status": "already_indexed",
                                   "name": meta[pdf_hash]["name"],
                                   "message": "This paper is already in your library."})
-        nodes = ingest_pdf_bytes(pdf_bytes, file.filename)
-        if not nodes:
-            return JSONResponse({"error": "Could not extract content from PDF."},
-                                  status_code=400)
-        add_paper_to_index(nodes, file.filename, pdf_hash)
-        return JSONResponse({"status": "indexed",
-                              "name": file.filename,
-                              "pages": len(nodes),
-                              "message": f"Successfully indexed {len(nodes)} pages."})
+        pdf_hash, page_count = ingest_pdf_bytes(pdf_bytes, file.filename)
+        meta[pdf_hash] = {"name": file.filename, "pages": page_count, "source_url": ""}
+        save_papers_meta(meta)
+        return JSONResponse({"status": "indexed", "name": file.filename,
+                              "pages": page_count,
+                              "message": f"Indexed {page_count} pages."})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/api/fetch_url")
 async def fetch_url(request: Request):
-    """Fetch a paper from a URL and add it to the index."""
     body = await request.json()
     url  = body.get("url", "").strip()
     if not url:
         return JSONResponse({"error": "No URL provided."}, status_code=400)
-
     resolved_url, error = resolve_paper_url(url)
     if error:
         return JSONResponse({"error": error}, status_code=400)
-
     pdf_bytes, filename, fetch_error = fetch_pdf_from_url(resolved_url)
     if fetch_error:
         return JSONResponse({"error": fetch_error}, status_code=400)
-
     try:
-        pdf_hash = hashlib.md5(pdf_bytes).hexdigest()[:8]
-        meta     = load_papers_meta()
+        pdf_hash  = hashlib.md5(pdf_bytes).hexdigest()[:10]
+        meta      = load_papers_meta()
         if pdf_hash in meta:
             return JSONResponse({"status": "already_indexed",
                                   "name": meta[pdf_hash]["name"],
-                                  "message": "This paper is already in your library."})
-        nodes = ingest_pdf_bytes(pdf_bytes, filename)
-        if not nodes:
-            return JSONResponse({"error": "Could not extract content from PDF."},
-                                  status_code=400)
-        add_paper_to_index(nodes, filename, pdf_hash, source_url=url)
-        return JSONResponse({"status": "indexed",
-                              "name": filename,
-                              "pages": len(nodes),
-                              "message": f"Successfully indexed {len(nodes)} pages."})
+                                  "message": "Already in library."})
+        pdf_hash, page_count = ingest_pdf_bytes(pdf_bytes, filename)
+        meta[pdf_hash] = {"name": filename, "pages": page_count, "source_url": url}
+        save_papers_meta(meta)
+        return JSONResponse({"status": "indexed", "name": filename,
+                              "pages": page_count,
+                              "message": f"Indexed {page_count} pages."})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.delete("/api/papers/{pdf_hash}")
 async def delete_paper(pdf_hash: str):
-    """Remove a paper from the index."""
     meta = load_papers_meta()
     if pdf_hash not in meta:
         return JSONResponse({"error": "Paper not found."}, status_code=404)
-
-    paper_name = meta[pdf_hash]["name"]
+    name = meta[pdf_hash]["name"]
     del meta[pdf_hash]
     save_papers_meta(meta)
-
-    # Rebuild index without this paper's nodes
-    try:
-        storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
-        existing_nodes  = list(storage_context.docstore.docs.values())
-        kept_nodes = [n for n in existing_nodes
-                      if n.metadata.get("pdf_hash") != pdf_hash]
-        if kept_nodes:
-            rebuild_index(kept_nodes)
-        else:
-            # No papers left — clear index
-            global _index
-            _index = None
-            if Path(INDEX_DIR).exists():
-                shutil.rmtree(INDEX_DIR)
-    except Exception:
-        pass
-
-    return JSONResponse({"status": "deleted", "name": paper_name})
+    if pdf_hash in _paper_store:
+        del _paper_store[pdf_hash]
+        save_paper_store()
+    return JSONResponse({"status": "deleted", "name": name})
 
 @app.post("/api/query")
 async def query(request: Request):
@@ -458,53 +385,35 @@ async def query(request: Request):
     question = body.get("question", "").strip()
     if not question:
         return JSONResponse({"error": "No question provided."}, status_code=400)
-
     counter = load_counter()
     if counter["spent"] >= TOTAL_BUDGET:
+        return JSONResponse({"answer": "⛔ Budget exhausted.",
+                              "citations": [], "budget_exhausted": True})
+    if not _paper_store:
         return JSONResponse({
-            "answer": "⛔ Budget exhausted. Please top up your Anthropic API credits.",
-            "citations": [], "budget_exhausted": True
-        })
-
-    idx = get_index()
-    if idx is None:
-        return JSONResponse({
-            "answer": "No papers have been indexed yet. Please upload a PDF or paste a paper URL to get started.",
-            "citations": []
-        })
-
-    retriever = idx.as_retriever(similarity_top_k=TOP_K)
-    nodes = retriever.retrieve(question)
-    if not nodes:
+            "answer": "No papers have been indexed yet. Upload a PDF or paste a URL to get started.",
+            "citations": []})
+    results = search_papers(question, top_k=TOP_K)
+    if not results:
         return JSONResponse({
             "answer": "I couldn't find relevant content in the indexed papers for that question.",
-            "citations": []
-        })
-
+            "citations": []})
     citations = []
     seen = set()
-    for node in nodes:
-        meta     = node.metadata or {}
-        filename = meta.get("file_name", "Unknown")
-        page     = meta.get("page_label", meta.get("page", "?"))
-        has_img  = bool(meta.get("image_path"))
-        score    = round(node.score or 0, 2)
-        key      = f"{filename}|{page}"
+    for r in results:
+        key = f"{r['name']}|{r['page']}"
         if key not in seen:
             seen.add(key)
-            citations.append({"file": filename, "page": page,
-                               "score": score, "hasImg": has_img})
-
+            citations.append({"file": r["name"], "page": r["page"],
+                               "score": 0.9, "hasImg": bool(r.get("img"))})
     try:
-        messages = build_messages(question, nodes)
+        messages = build_messages(question, results)
         response = anthropic_client.messages.create(
             model=MODEL, max_tokens=2048,
-            system=SYSTEM_PROMPT, messages=messages,
-        )
+            system=SYSTEM_PROMPT, messages=messages)
         answer = response.content[0].text
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
     counter_data = increment_counter()
     return JSONResponse({
         "answer":    answer,
@@ -517,4 +426,4 @@ async def query(request: Request):
     })
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
