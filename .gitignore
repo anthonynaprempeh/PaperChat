@@ -1,0 +1,9 @@
+venv/
+storage/
+page_images/
+papers_meta.json
+query_counter.json
+.DS_Store
+__pycache__/
+*.pyc
+papers/
