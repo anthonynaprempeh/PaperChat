@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>PaperChat — AI Research Assistant</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&family=Inter:wght@300;400;500&display=swap" rel="stylesheet"/>
+<script>
+MathJax = {
+  tex:{ inlineMath:[['$','$'],['\\(','\\)']], displayMath:[['$$','$$'],['\\[','\\]']], processEscapes:true },
+  options:{ skipHtmlTags:['script','noscript','style','textarea','pre'] },
+  startup:{ typeset:false }
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+<style>
+:root{
+  --ink:#0a0b0d; --paper:#faf8f5; --cream:#ede9e2; --warm:#d4cfc6;
+  --red:#c8102e; --red2:#a00d24; --gold:#c9973a; --teal:#0f6e56;
+  --blue:#185fa5; --text:#1a1a1a; --muted:#6b6560;
+  --border:rgba(0,0,0,0.08); --border2:rgba(0,0,0,0.14);
+  --mono:'JetBrains Mono',monospace; --disp:'Syne',sans-serif;
+  --body:'Inter',sans-serif; --sw:300px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--paper);font-family:var(--body);color:var(--text);overflow:hidden}
+.shell{display:flex;height:100vh;overflow:hidden}
+
+/* ── Sidebar ── */
+.sidebar{
+  width:var(--sw);flex-shrink:0;background:var(--ink);
+  display:flex;flex-direction:column;
+  transition:width 0.3s cubic-bezier(0.4,0,0.2,1),opacity 0.3s;
+  overflow:hidden;
+}
+.sidebar.collapsed{width:0;opacity:0;pointer-events:none}
+
+/* ── Brand ── */
+.brand{
+  padding:18px 16px 14px;border-bottom:1px solid rgba(255,255,255,0.06);
+  display:flex;align-items:center;gap:10px;flex-shrink:0;
+}
+.brand-icon{
+  width:32px;height:32px;border-radius:9px;background:var(--red);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.brand-name{font-family:var(--disp);font-size:17px;font-weight:700;color:white;letter-spacing:-0.02em}
+.brand-sub{font-size:9px;color:rgba(255,255,255,0.3);margin-top:1px;letter-spacing:0.07em;text-transform:uppercase}
+
+/* ── Add paper panel ── */
+.add-panel{
+  padding:14px 14px 10px;border-bottom:1px solid rgba(255,255,255,0.06);
+  flex-shrink:0;
+}
+.add-title{
+  font-size:9.5px;font-weight:600;letter-spacing:0.1em;
+  color:rgba(255,255,255,0.3);text-transform:uppercase;
+  font-family:var(--mono);margin-bottom:10px;
+}
+
+/* Drop zone */
+.drop-zone{
+  border:1.5px dashed rgba(255,255,255,0.15);border-radius:10px;
+  padding:14px 12px;text-align:center;cursor:pointer;
+  transition:all 0.2s;margin-bottom:8px;position:relative;
+}
+.drop-zone:hover,.drop-zone.drag-over{
+  border-color:rgba(200,16,46,0.5);background:rgba(200,16,46,0.06);
+}
+.drop-zone input[type=file]{
+  position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;
+}
+.dz-icon{font-size:1.4rem;margin-bottom:4px;opacity:0.4}
+.dz-text{font-size:11px;color:rgba(255,255,255,0.4);line-height:1.4}
+.dz-text strong{color:rgba(255,255,255,0.7)}
+
+/* URL input */
+.url-row{display:flex;gap:6px;margin-bottom:0}
+.url-input{
+  flex:1;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);
+  border-radius:7px;padding:7px 10px;color:rgba(255,255,255,0.85);
+  font-family:var(--mono);font-size:11px;outline:none;
+  transition:border-color 0.2s;
+}
+.url-input::placeholder{color:rgba(255,255,255,0.25)}
+.url-input:focus{border-color:rgba(200,16,46,0.5)}
+.url-btn{
+  background:var(--red);border:none;border-radius:7px;
+  padding:7px 12px;color:white;cursor:pointer;font-size:11px;
+  font-weight:600;transition:background 0.15s;white-space:nowrap;flex-shrink:0;
+}
+.url-btn:hover{background:var(--red2)}
+
+/* Upload status */
+.upload-status{
+  margin-top:8px;font-size:10.5px;font-family:var(--mono);
+  padding:6px 10px;border-radius:6px;display:none;
+}
+.upload-status.success{background:rgba(15,110,86,0.2);color:#4ade80;border:1px solid rgba(15,110,86,0.3)}
+.upload-status.error{background:rgba(200,16,46,0.15);color:#f87171;border:1px solid rgba(200,16,46,0.3)}
+.upload-status.loading{background:rgba(255,255,255,0.05);color:rgba(255,255,255,0.5);border:1px solid rgba(255,255,255,0.1)}
+
+/* ── Papers list ── */
+.sidebar-body{flex:1;overflow-y:auto;min-height:0;padding:8px 0}
+.sidebar-body::-webkit-scrollbar{width:2px}
+.sidebar-body::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:1px}
+
+.s-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:8px 16px;
+}
+.s-title{font-size:9.5px;font-weight:600;letter-spacing:0.1em;color:rgba(255,255,255,0.3);text-transform:uppercase;font-family:var(--mono)}
+.s-count{font-size:9px;font-family:var(--mono);color:rgba(255,255,255,0.2)}
+
+.papers-list{padding:0 10px 10px}
+.paper-item{
+  display:flex;align-items:flex-start;gap:8px;
+  padding:7px 8px;border-radius:8px;
+  transition:background 0.15s;cursor:default;
+  border:1px solid transparent;margin-bottom:3px;
+}
+.paper-item:hover{background:rgba(255,255,255,0.04);border-color:rgba(255,255,255,0.06)}
+.p-dot{
+  width:6px;height:6px;border-radius:50%;
+  margin-top:5px;flex-shrink:0;background:var(--red);
+}
+.p-info{flex:1;min-width:0}
+.p-name{
+  font-size:10.5px;color:rgba(255,255,255,0.75);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  font-family:var(--mono);display:block;
+}
+.p-meta{font-size:9px;color:rgba(255,255,255,0.25);margin-top:2px}
+.p-del{
+  width:16px;height:16px;border-radius:4px;border:none;
+  background:transparent;color:rgba(255,255,255,0.2);cursor:pointer;
+  font-size:11px;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;transition:all 0.15s;opacity:0;
+}
+.paper-item:hover .p-del{opacity:1}
+.p-del:hover{background:rgba(200,16,46,0.3);color:#f87171}
+
+.no-papers{
+  padding:16px 14px;font-size:11px;color:rgba(255,255,255,0.2);
+  font-family:var(--mono);text-align:center;line-height:1.6;
+}
+
+/* ── Budget ── */
+.budget-bar{
+  padding:10px 14px 12px;border-top:1px solid rgba(255,255,255,0.06);
+  flex-shrink:0;
+}
+.budget-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.budget-label{font-size:9.5px;color:rgba(255,255,255,0.3);font-family:var(--mono)}
+.budget-nums{font-size:9.5px;font-family:var(--mono);color:rgba(255,255,255,0.5)}
+.bar-track{height:2px;border-radius:1px;background:rgba(255,255,255,0.07);overflow:hidden}
+.bar-fill{height:100%;background:var(--red);border-radius:1px;transition:width 0.4s}
+
+/* ── Main ── */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--paper)}
+
+/* ── Topbar ── */
+.topbar{
+  padding:12px 20px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:12px;
+  background:rgba(250,248,245,0.9);backdrop-filter:blur(12px);
+  flex-shrink:0;z-index:10;position:relative;
+}
+.toggle-btn{
+  width:32px;height:32px;border-radius:8px;border:1px solid var(--border2);
+  background:white;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;transition:all 0.15s;box-shadow:0 1px 3px rgba(0,0,0,0.06);
+}
+.toggle-btn:hover{background:var(--cream)}
+.topbar-title{font-family:var(--disp);font-size:15px;font-weight:700;color:var(--ink);flex:1;letter-spacing:-0.01em}
+.status-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 2px rgba(34,197,94,0.2);animation:pulse 2s infinite;flex-shrink:0}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 2px rgba(34,197,94,0.2)}50%{box-shadow:0 0 0 4px rgba(34,197,94,0.1)}}
+.tpill{font-size:9.5px;font-family:var(--mono);padding:4px 10px;border-radius:20px;border:1px solid var(--border2);background:white;color:var(--muted);letter-spacing:0.03em}
+
+/* ── Messages ── */
+.messages{
+  flex:1;overflow-y:auto;padding:24px 24px 10px;
+  display:flex;flex-direction:column;gap:18px;scroll-behavior:smooth;
+}
+.messages::-webkit-scrollbar{width:4px}
+.messages::-webkit-scrollbar-thumb{background:var(--warm);border-radius:2px}
+
+/* ── Welcome ── */
+.welcome{
+  display:flex;flex-direction:column;align-items:center;
+  justify-content:center;flex:1;text-align:center;padding:40px 24px;gap:6px;
+}
+.welcome-icon{
+  width:60px;height:60px;border-radius:18px;background:var(--ink);
+  display:flex;align-items:center;justify-content:center;
+  margin-bottom:14px;box-shadow:0 4px 20px rgba(0,0,0,0.12);
+}
+.welcome-name{font-family:var(--disp);font-size:36px;font-weight:800;color:var(--ink);letter-spacing:-0.03em;line-height:1}
+.welcome-name span{color:var(--red)}
+.welcome-sub{font-size:14px;color:var(--muted);max-width:400px;line-height:1.7;margin-top:8px;font-weight:300}
+.welcome-steps{
+  display:flex;gap:12px;margin-top:24px;flex-wrap:wrap;justify-content:center;
+  max-width:560px;
+}
+.step-card{
+  background:white;border:1px solid var(--border);border-radius:12px;
+  padding:14px 16px;text-align:left;flex:1;min-width:140px;max-width:180px;
+  box-shadow:0 1px 6px rgba(0,0,0,0.05);
+}
+.step-num{
+  width:22px;height:22px;border-radius:6px;background:var(--red);
+  color:white;font-size:11px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;
+  margin-bottom:8px;font-family:var(--mono);
+}
+.step-title{font-size:12px;font-weight:600;color:var(--ink);margin-bottom:3px}
+.step-desc{font-size:11px;color:var(--muted);line-height:1.5}
+
+.welcome-chips{display:flex;flex-wrap:wrap;gap:7px;justify-content:center;margin-top:20px;max-width:560px}
+.chip{
+  padding:8px 14px;border-radius:100px;border:1px solid var(--border2);
+  font-size:12px;color:var(--text);cursor:pointer;background:white;
+  transition:all 0.15s;box-shadow:0 1px 3px rgba(0,0,0,0.04);
+}
+.chip:hover{border-color:var(--red);color:var(--red);transform:translateY(-1px)}
+
+/* ── Messages ── */
+.msg-user{align-self:flex-end;max-width:58%;animation:fadeUp 0.2s ease}
+.msg-user-bubble{
+  background:var(--ink);color:rgba(255,255,255,0.9);
+  padding:11px 16px;border-radius:18px 18px 4px 18px;
+  font-size:14px;line-height:1.6;box-shadow:0 2px 10px rgba(0,0,0,0.12);
+}
+.msg-bot{align-self:flex-start;max-width:86%;animation:fadeUp 0.2s ease}
+.bot-header{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.bot-avatar{
+  width:26px;height:26px;border-radius:8px;background:var(--red);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.bot-label{font-size:11px;font-weight:600;color:var(--muted);font-family:var(--mono);letter-spacing:0.04em}
+.msg-bot-bubble{
+  background:white;border:1px solid var(--border);
+  padding:15px 17px;border-radius:4px 18px 18px 18px;
+  font-size:14px;line-height:1.78;color:var(--text);
+  box-shadow:0 2px 10px rgba(0,0,0,0.05);
+}
+.msg-bot-bubble h1{font-family:var(--disp);font-size:17px;font-weight:700;color:var(--ink);margin:10px 0 6px}
+.msg-bot-bubble h2{font-family:var(--disp);font-size:15px;font-weight:700;color:var(--ink);margin:8px 0 4px}
+.msg-bot-bubble h3{font-size:12.5px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;font-family:var(--mono);margin:8px 0 4px}
+.msg-bot-bubble strong{color:var(--ink);font-weight:600}
+.msg-bot-bubble ul,.msg-bot-bubble ol{padding-left:20px;margin:6px 0}
+.msg-bot-bubble li{margin-bottom:4px}
+.msg-bot-bubble table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13px}
+.msg-bot-bubble th{background:var(--cream);color:var(--ink);padding:7px 12px;border:1px solid var(--border2);font-weight:600;font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:0.04em}
+.msg-bot-bubble td{padding:7px 12px;border:1px solid var(--border);color:var(--text)}
+.msg-bot-bubble tr:hover td{background:var(--paper)}
+.msg-bot-bubble code{font-family:var(--mono);font-size:12px;background:var(--cream);border:1px solid var(--border);padding:1px 6px;border-radius:4px;color:#1a2e3b}
+.msg-bot-bubble pre{background:var(--ink);border-radius:10px;padding:12px 14px;margin:8px 0;overflow-x:auto}
+.msg-bot-bubble pre code{background:none;border:none;color:rgba(255,255,255,0.85);font-size:12px;padding:0}
+
+/* ── Citations ── */
+.cites{margin-top:12px;padding-top:10px;border-top:1px solid var(--border)}
+.cites-label{font-size:9px;font-weight:600;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;font-family:var(--mono);margin-bottom:6px}
+.cite-row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:5px 8px;border-radius:7px;border:1px solid var(--border);
+  background:var(--paper);margin-bottom:3px;transition:border-color 0.15s;
+}
+.cite-row:hover{border-color:var(--border2)}
+.cite-left{display:flex;align-items:center;gap:7px;min-width:0}
+.cite-icon{width:16px;height:16px;border-radius:4px;background:var(--cream);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.cite-name{font-size:11px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px;font-family:var(--mono)}
+.cite-pg{font-size:10px;color:var(--muted);flex-shrink:0;font-family:var(--mono)}
+.cite-score{font-size:10px;font-family:var(--mono);font-weight:500;padding:2px 7px;border-radius:20px;flex-shrink:0}
+.score-high{background:#dcfce7;color:#166534;border:1px solid #bbf7d0}
+.score-mid{background:#fef9c3;color:#854d0e;border:1px solid #fde68a}
+.score-low{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}
+
+.budget-inline{
+  display:flex;align-items:center;gap:10px;margin-top:8px;padding-top:6px;
+  border-top:1px solid var(--border);font-size:10px;color:var(--muted);font-family:var(--mono);
+}
+.bi-bar{flex:1;height:2px;border-radius:1px;background:var(--cream);overflow:hidden}
+.bi-fill{height:100%;background:var(--red);border-radius:1px;transition:width 0.4s}
+
+/* ── Thinking ── */
+.thinking{display:flex;gap:5px;align-items:center;padding:4px 0}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--warm);animation:bounce 1.2s infinite ease-in-out}
+.dot:nth-child(2){animation-delay:0.18s}
+.dot:nth-child(3){animation-delay:0.36s}
+@keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-8px)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+
+/* ── Input ── */
+.input-wrap{
+  padding:12px 20px 16px;flex-shrink:0;
+  border-top:1px solid var(--border);
+  background:rgba(250,248,245,0.9);backdrop-filter:blur(12px);
+}
+.input-row{
+  display:flex;align-items:flex-end;gap:8px;background:white;
+  border:1.5px solid var(--border2);border-radius:14px;
+  padding:9px 11px;transition:border-color 0.2s,box-shadow 0.2s;
+  box-shadow:0 2px 10px rgba(0,0,0,0.05);
+}
+.input-row:focus-within{border-color:var(--ink);box-shadow:0 4px 18px rgba(0,0,0,0.09)}
+#input{
+  flex:1;border:none;outline:none;resize:none;
+  font-family:var(--body);font-size:14px;
+  color:var(--text);background:transparent;
+  min-height:22px;max-height:120px;line-height:1.5;
+}
+#input::placeholder{color:var(--warm)}
+.send-btn{
+  width:34px;height:34px;border-radius:9px;background:var(--ink);
+  border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;transition:all 0.18s;
+}
+.send-btn:hover{background:var(--red);transform:scale(1.04)}
+.send-btn:active{transform:scale(0.97)}
+.input-footer{
+  display:flex;justify-content:center;margin-top:6px;
+  font-size:10px;color:var(--muted);font-family:var(--mono);letter-spacing:0.03em;
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <rect x="2" y="1" width="9" height="12" rx="1.5" stroke="white" stroke-width="1.2"/>
+          <path d="M5 5h5M5 7.5h5M5 10h3" stroke="white" stroke-width="1" stroke-linecap="round"/>
+          <circle cx="12.5" cy="11.5" r="2.5" fill="white"/>
+          <path d="M11.5 11.5h2M12.5 10.5v2" stroke="#c8102e" stroke-width="1" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-name">PaperChat</div>
+        <div class="brand-sub">AI Research Assistant</div>
+      </div>
+    </div>
+
+    <!-- Add paper -->
+    <div class="add-panel">
+      <div class="add-title">Add Papers</div>
+
+      <div class="drop-zone" id="drop-zone">
+        <input type="file" accept=".pdf" id="file-input" multiple/>
+        <div class="dz-icon">📄</div>
+        <div class="dz-text"><strong>Drop PDF here</strong><br>or click to browse</div>
+      </div>
+
+      <div class="url-row">
+        <input class="url-input" id="url-input" type="text"
+               placeholder="arXiv / bioRxiv / PDF URL…"/>
+        <button class="url-btn" onclick="fetchUrl()">Fetch</button>
+      </div>
+
+      <div class="upload-status" id="upload-status"></div>
+    </div>
+
+    <!-- Papers list -->
+    <div class="sidebar-body">
+      <div class="s-header">
+        <span class="s-title">Library</span>
+        <span class="s-count" id="paper-count">0 papers</span>
+      </div>
+      <div class="papers-list" id="papers-list">
+        <div class="no-papers">No papers yet.<br>Upload a PDF or paste a URL above.</div>
+      </div>
+    </div>
+
+    <!-- Budget -->
+    <div class="budget-bar">
+      <div class="budget-row">
+        <span class="budget-label">API usage</span>
+        <span class="budget-nums" id="b-nums">$0.00 / $10.00</span>
+      </div>
+      <div class="bar-track"><div class="bar-fill" id="b-fill" style="width:0%"></div></div>
+    </div>
+  </aside>
+
+  <!-- ── Main ── -->
+  <div class="main">
+    <div class="topbar">
+      <button class="toggle-btn" onclick="toggleSidebar()">
+        <svg width="15" height="12" viewBox="0 0 15 12" fill="none">
+          <path d="M1 1h13M1 6h9M1 11h13" stroke="var(--ink)" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <div class="status-dot"></div>
+      <span class="topbar-title">PaperChat</span>
+      <span class="tpill" id="pill-papers">0 papers</span>
+      <span class="tpill" id="pill-queries">0 queries</span>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="welcome" id="welcome">
+        <div class="welcome-icon">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+            <rect x="4" y="2" width="16" height="22" rx="2.5" stroke="white" stroke-width="1.5"/>
+            <path d="M8 9h8M8 13h8M8 17h5" stroke="white" stroke-width="1.2" stroke-linecap="round"/>
+            <circle cx="21" cy="21" r="5" fill="white"/>
+            <path d="M19 21h4M21 19v4" stroke="#c8102e" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="welcome-name">Paper<span>Chat</span></div>
+        <div class="welcome-sub">Upload any research paper and ask questions. Get answers with citations, equations, and figure descriptions.</div>
+        <div class="welcome-steps">
+          <div class="step-card">
+            <div class="step-num">1</div>
+            <div class="step-title">Add a paper</div>
+            <div class="step-desc">Upload a PDF or paste an arXiv / bioRxiv link</div>
+          </div>
+          <div class="step-card">
+            <div class="step-num">2</div>
+            <div class="step-title">Ask anything</div>
+            <div class="step-desc">Methods, results, equations, figures — anything</div>
+          </div>
+          <div class="step-card">
+            <div class="step-num">3</div>
+            <div class="step-title">Get answers</div>
+            <div class="step-desc">Cited responses with page numbers and visuals</div>
+          </div>
+        </div>
+        <div class="welcome-chips">
+          <div class="chip" onclick="sendChip(this)">What is the main finding of this paper?</div>
+          <div class="chip" onclick="sendChip(this)">Summarise the methods used</div>
+          <div class="chip" onclick="sendChip(this)">What equations are used?</div>
+          <div class="chip" onclick="sendChip(this)">What are the key limitations?</div>
+          <div class="chip" onclick="sendChip(this)">Compare the results across papers</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="input-wrap">
+      <div class="input-row">
+        <textarea id="input" rows="1"
+          placeholder="Ask about your papers…"
+          onkeydown="handleKey(event)"
+          oninput="autoResize(this)"></textarea>
+        <button class="send-btn" onclick="sendMessage()">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M2 8h12M9 3l5 5-5 5" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="input-footer">PaperChat · Powered by Claude · Answers grounded in your papers</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const COST_PER_QUERY = 0.008;
+const TOTAL_BUDGET   = 10.00;
+const DOTS = ['#c8102e','#185fa5','#0f6e56','#c9973a','#6d28d9','#0e7490','#be185d'];
+
+let queryCount  = parseInt(localStorage.getItem('paperchat_queries') || '0');
+let chatHistory = JSON.parse(localStorage.getItem('paperchat_history') || '[]');
+let sidebarOpen = true;
+
+// ── Sidebar ──────────────────────────────────────────────────────────────────
+function toggleSidebar(){
+  sidebarOpen = !sidebarOpen;
+  document.getElementById('sidebar').classList.toggle('collapsed', !sidebarOpen);
+}
+
+// ── Papers ───────────────────────────────────────────────────────────────────
+async function loadPapers(){
+  try{
+    const r = await fetch('/api/papers');
+    const d = await r.json();
+    renderPapers(d.papers || []);
+  }catch(e){
+    renderPapers([]);
+  }
+}
+
+function renderPapers(papers){
+  const el    = document.getElementById('papers-list');
+  const count = document.getElementById('paper-count');
+  const pill  = document.getElementById('pill-papers');
+  count.textContent = papers.length + ' paper' + (papers.length !== 1 ? 's' : '');
+  pill.textContent  = papers.length + ' paper' + (papers.length !== 1 ? 's' : '');
+
+  if(!papers.length){
+    el.innerHTML = '<div class="no-papers">No papers yet.<br>Upload a PDF or paste a URL above.</div>';
+    return;
+  }
+  el.innerHTML = papers.map((p, i) => `
+    <div class="paper-item">
+      <div class="p-dot" style="background:${DOTS[i%DOTS.length]}"></div>
+      <div class="p-info">
+        <span class="p-name" title="${escHtml(p.name)}">${escHtml(p.name)}</span>
+        <div class="p-meta">${p.pages} pages${p.source_url ? ' · URL' : ''}</div>
+      </div>
+      <button class="p-del" onclick="deletePaper('${p.hash}')" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+async function deletePaper(hash){
+  if(!confirm('Remove this paper from your library?')) return;
+  try{
+    const r = await fetch('/api/papers/' + hash, {method:'DELETE'});
+    const d = await r.json();
+    showStatus(d.name + ' removed.', 'success');
+    loadPapers();
+  }catch(e){
+    showStatus('Could not remove paper.', 'error');
+  }
+}
+
+// ── Upload ───────────────────────────────────────────────────────────────────
+const dropZone  = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('drag-over');
+  const files = Array.from(e.dataTransfer.files).filter(f => f.name.endsWith('.pdf'));
+  if(files.length) uploadFiles(files);
+});
+fileInput.addEventListener('change', () => {
+  const files = Array.from(fileInput.files);
+  if(files.length) uploadFiles(files);
+  fileInput.value = '';
+});
+
+async function uploadFiles(files){
+  for(const file of files){
+    showStatus('Indexing ' + file.name + '…', 'loading');
+    const fd = new FormData();
+    fd.append('file', file);
+    try{
+      const r = await fetch('/api/upload', {method:'POST', body: fd});
+      const d = await r.json();
+      if(d.error) showStatus('Error: ' + d.error, 'error');
+      else if(d.status === 'already_indexed') showStatus(d.name + ' already in library.', 'success');
+      else showStatus('✓ ' + d.name + ' — ' + d.pages + ' pages indexed.', 'success');
+      loadPapers();
+    }catch(e){
+      showStatus('Upload failed: ' + e.message, 'error');
+    }
+  }
+}
+
+async function fetchUrl(){
+  const url = document.getElementById('url-input').value.trim();
+  if(!url){ showStatus('Please enter a URL.', 'error'); return; }
+  showStatus('Fetching paper…', 'loading');
+  try{
+    const r = await fetch('/api/fetch_url', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url})
+    });
+    const d = await r.json();
+    if(d.error) showStatus('Error: ' + d.error, 'error');
+    else if(d.status === 'already_indexed') showStatus(d.name + ' already in library.', 'success');
+    else showStatus('✓ ' + d.name + ' — ' + d.pages + ' pages indexed.', 'success');
+    document.getElementById('url-input').value = '';
+    loadPapers();
+  }catch(e){
+    showStatus('Fetch failed: ' + e.message, 'error');
+  }
+}
+
+document.getElementById('url-input').addEventListener('keydown', e => {
+  if(e.key === 'Enter') fetchUrl();
+});
+
+function showStatus(msg, type){
+  const el = document.getElementById('upload-status');
+  el.textContent = msg;
+  el.className = 'upload-status ' + type;
+  el.style.display = 'block';
+  if(type !== 'loading') setTimeout(() => el.style.display = 'none', 4000);
+}
+
+// ── Budget ───────────────────────────────────────────────────────────────────
+async function updateBudget(){
+  try{
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    queryCount = d.queries;
+    const pct = Math.min(Math.round((d.spent/TOTAL_BUDGET)*100), 100);
+    document.getElementById('b-fill').style.width = pct + '%';
+    document.getElementById('b-nums').textContent = '$' + d.spent.toFixed(2) + ' / $' + TOTAL_BUDGET.toFixed(2);
+    document.getElementById('pill-queries').textContent = d.queries + ' quer' + (d.queries===1?'y':'ies');
+  }catch(e){}
+}
+
+// ── Chat ─────────────────────────────────────────────────────────────────────
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function timeStr(){const d=new Date();return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0')}
+function scoreClass(s){return s>=0.8?'score-high':s>=0.65?'score-mid':'score-low'}
+function autoResize(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px'}
+function handleKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}}
+function sendChip(el){document.getElementById('input').value=el.textContent;sendMessage()}
+function hideWelcome(){const w=document.getElementById('welcome');if(w)w.remove()}
+
+function renderContent(text){
+  let h=text;
+  h=h.replace(/^### (.+)$/gm,'<h3>$1</h3>');
+  h=h.replace(/^## (.+)$/gm,'<h2>$1</h2>');
+  h=h.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+  h=h.replace(/\|(.+)\|\n\|[-| :]+\|\n((?:\|.+\|\n?)*)/g,(_,hdr,body)=>{
+    const ths=hdr.split('|').filter(c=>c.trim()).map(c=>`<th>${c.trim()}</th>`).join('');
+    const rows=body.trim().split('\n').map(row=>{const tds=row.split('|').filter(c=>c.trim()).map(c=>`<td>${c.trim()}</td>`).join('');return`<tr>${tds}</tr>`}).join('');
+    return`<table><thead><tr>${ths}</tr></thead><tbody>${rows}</tbody></table>`;
+  });
+  h=h.replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>');
+  h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
+  h=h.replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');
+  h=h.replace(/(?:^|\n)[-•]\s(.+)/g,'\n<li>$1</li>');
+  h=h.replace(/(<li>[\s\S]*?<\/li>)+/g,m=>`<ul>${m}</ul>`);
+  h=h.replace(/(?:^|\n)\d+\.\s(.+)/g,'\n<li>$1</li>');
+  h=h.replace(/^---+$/gm,'<hr style="border:none;border-top:1px solid var(--border);margin:10px 0">');
+  h=h.replace(/\n/g,'<br>');
+  return h;
+}
+
+async function typesetMath(el){if(window.MathJax&&MathJax.typesetPromise)await MathJax.typesetPromise([el])}
+
+function appendUserMsg(text){
+  hideWelcome();
+  const msgs=document.getElementById('messages');
+  const div=document.createElement('div');div.className='msg-user';
+  div.innerHTML=`<div class="msg-user-bubble">${escHtml(text)}</div>`;
+  msgs.appendChild(div);msgs.scrollTop=msgs.scrollHeight;
+}
+
+function appendThinking(){
+  const msgs=document.getElementById('messages');
+  const div=document.createElement('div');div.className='msg-bot';div.id='thinking';
+  div.innerHTML=`
+    <div class="bot-header">
+      <div class="bot-avatar"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="1.5" y="1" width="7" height="10" rx="1.5" stroke="white" stroke-width="1"/><path d="M3 4h4M3 6h4M3 8h2" stroke="white" stroke-width="0.8" stroke-linecap="round"/></svg></div>
+      <span class="bot-label">PaperChat</span>
+    </div>
+    <div class="msg-bot-bubble"><div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div>`;
+  msgs.appendChild(div);msgs.scrollTop=msgs.scrollHeight;
+}
+
+function removeThinking(){const t=document.getElementById('thinking');if(t)t.remove()}
+
+async function appendBotMsg(answer, citations, bi){
+  removeThinking();
+  const msgs=document.getElementById('messages');
+  const div=document.createElement('div');div.className='msg-bot';
+
+  const citesHtml = citations.length ? `
+    <div class="cites">
+      <div class="cites-label">Sources</div>
+      ${citations.map(c=>`
+        <div class="cite-row">
+          <div class="cite-left">
+            <div class="cite-icon"><svg width="8" height="9" viewBox="0 0 8 9" fill="none"><rect x="1" y="0.5" width="6" height="8" rx="1" stroke="var(--muted)" stroke-width="0.8"/><line x1="2" y1="3" x2="6" y2="3" stroke="var(--muted)" stroke-width="0.7"/><line x1="2" y1="5" x2="6" y2="5" stroke="var(--muted)" stroke-width="0.7"/></svg></div>
+            <span class="cite-name" title="${escHtml(c.file)}">${escHtml(c.file)}</span>
+            <span class="cite-pg">p.${c.page}${c.hasImg?' ·img':''}</span>
+          </div>
+          <span class="cite-score ${scoreClass(c.score)}">${c.score.toFixed(2)}</span>
+        </div>`).join('')}
+      ${bi ? `<div class="budget-inline">
+        <span>Query ${bi.queries} · $${bi.spent.toFixed(2)}</span>
+        <div class="bi-bar"><div class="bi-fill" style="width:${Math.min(100,Math.round(bi.spent/TOTAL_BUDGET*100))}%"></div></div>
+        <span>$${bi.left.toFixed(2)} left</span>
+      </div>` : ''}
+    </div>` : '';
+
+  const bubble=document.createElement('div');bubble.className='msg-bot-bubble';
+  bubble.innerHTML=renderContent(answer)+citesHtml;
+  div.innerHTML=`<div class="bot-header"><div class="bot-avatar"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="1.5" y="1" width="7" height="10" rx="1.5" stroke="white" stroke-width="1"/><path d="M3 4h4M3 6h4M3 8h2" stroke="white" stroke-width="0.8" stroke-linecap="round"/></svg></div><span class="bot-label">PaperChat</span></div>`;
+  div.appendChild(bubble);msgs.appendChild(div);
+  await typesetMath(bubble);msgs.scrollTop=msgs.scrollHeight;
+}
+
+async function sendMessage(){
+  const input=document.getElementById('input');
+  const question=input.value.trim();
+  if(!question)return;
+  input.value='';input.style.height='auto';
+  appendUserMsg(question);appendThinking();
+  try{
+    const r=await fetch('/api/query',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question})
+    });
+    if(!r.ok) throw new Error('Server error '+r.status);
+    const data=await r.json();
+    updateBudget();
+    await appendBotMsg(data.answer, data.citations||[], data.budget);
+  }catch(err){
+    removeThinking();
+    await appendBotMsg('Could not connect to the PaperChat server. Make sure `python app.py` is running, then refresh.',[],null);
+  }
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+loadPapers();
+updateBudget();
+</script>
+</body>
+</html>
